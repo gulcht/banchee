@@ -26,11 +26,19 @@ DATE_TIME_PATTERN = re.compile(r"^(\d{1,2}/\d{1,2}/\d{2,4}(?:\s+\d{1,2}:\d{2}(?:
 # Regex pattern for amounts with commas and decimals, e.g. 6,109.00 or -1,500.00
 AMOUNT_PATTERN = re.compile(r"^-?[\d,]+\.\d{2}$")
 
+# Known withdrawal channels/codes across Thai banks (e.g. SCB, KBank)
+WITHDRAWAL_CHANNELS = {"XW", "CW", "DW", "PW", "SW", "TW", "DD", "FE", "IT", "EDC"}
+DEPOSIT_CHANNELS = {"XP", "XD", "CD", "PD", "SD", "TD", "CR"}
+
 
 def parse_statement_line(line: str) -> Optional[Dict[str, str]]:
     """Parse a single transaction line into structured columns."""
     line = line.strip()
     if not line:
+        return None
+
+    # Skip footer / summary lines
+    if "รายการ" in line or "Total Credit" in line or "Total Debit" in line or "Items" in line:
         return None
 
     # Check if line starts with Date/Time
@@ -71,18 +79,35 @@ def parse_statement_line(line: str) -> Optional[Dict[str, str]]:
         if len(pre_tokens) >= 3:
             cheque_no = " ".join(pre_tokens[2:])
 
+        # Skip if channel or code is a summary indicator
+        if channel in ["รายการ", "Total"] or "รายการ" in code:
+            return None
+
         # Extract amounts
         amounts = [tokens[idx] for idx in amount_indices]
         if len(amounts) == 1:
-            # Only balance or one amount
+            # Only balance
             balance = amounts[0]
         elif len(amounts) == 2:
-            # Amount and Balance
+            # Transaction Amount and Ending Balance
             amt, balance = amounts[0], amounts[1]
-            if amt.startswith("-"):
-                withdrawal = amt.replace("-", "")
+            amt_clean = amt.replace("-", "")
+
+            # Classify Debit vs Credit based on Channel/Sign
+            if (
+                amt.startswith("-")
+                or channel.upper() in WITHDRAWAL_CHANNELS
+                or channel.upper().endswith("W")
+            ):
+                withdrawal = amt_clean
+            elif (
+                channel.upper() in DEPOSIT_CHANNELS
+                or channel.upper().endswith("D")
+                or channel.upper().endswith("P")
+            ):
+                deposit = amt_clean
             else:
-                deposit = amt
+                deposit = amt_clean
         elif len(amounts) >= 3:
             withdrawal = amounts[0]
             deposit = amounts[1]
@@ -106,7 +131,7 @@ def parse_statement_line(line: str) -> Optional[Dict[str, str]]:
             desc_parts = post_tokens
 
     else:
-        # No numerical amounts found - skip header or non-transaction line
+        # No numerical amounts found
         return None
 
     return {
@@ -138,18 +163,24 @@ def extract_statement_data(pdf_path: Path) -> List[Dict[str, str]]:
                 if not cleaned:
                     continue
 
-                # Ignore known header boilerplate text
+                # Ignore known header and summary boilerplate text
                 if any(
                     hdr in cleaned
                     for hdr in [
                         "วัน/เวลา",
                         "Date/Time",
                         "จำนวนเงินที่หักบัญชี",
+                        "จำนวนเงินนำเข้าบัญชี",
+                        "Total Credit Amount",
+                        "Total Debit Amount",
                         "Withdrawal",
                         "Deposit",
                         "Balance",
                         "เลขที่บัญชี",
                         "Account No",
+                        "ยอดเงินคงเหลือ",
+                        "รวมทั้งสิ้น",
+                        "รายการ (Items)",
                     ]
                 ):
                     continue
@@ -180,6 +211,27 @@ def extract_statement_data(pdf_path: Path) -> List[Dict[str, str]]:
     return transactions
 
 
+def format_and_clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Format Date/Time column to datetime and amount columns to numeric types."""
+    if "Date/Time" in df.columns:
+        df["Date/Time"] = pd.to_datetime(
+            df["Date/Time"], dayfirst=True, errors="coerce"
+        )
+
+    numeric_columns = ["Withdrawal (Debit)", "Deposit (Credit)", "Balance"]
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
 def pdf_to_excel(pdf_path: str, output_excel_path: Optional[str] = None) -> Path:
     pdf_file = Path(pdf_path)
     if not pdf_file.exists():
@@ -195,7 +247,6 @@ def pdf_to_excel(pdf_path: str, output_excel_path: Optional[str] = None) -> Path
 
     if not records:
         print("No transactions matched statement pattern. Trying generic table extraction...")
-        # Fallback to generic table extraction
         all_rows = []
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
@@ -212,7 +263,34 @@ def pdf_to_excel(pdf_path: str, output_excel_path: Optional[str] = None) -> Path
     else:
         df = pd.DataFrame(records, columns=STATEMENT_COLUMNS)
 
-    df.to_excel(output_excel_path, index=False, engine="openpyxl")
+    # Apply datetime and numeric format transformations
+    df = format_and_clean_dataframe(df)
+
+    # Write to Excel with custom cell number formats
+    with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Statement")
+        worksheet = writer.sheets["Statement"]
+
+        # Apply cell formats & auto-adjust column width
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            max_len = max(
+                len(str(col_name)),
+                max((len(str(val or "")) for val in df[col_name]), default=0),
+            )
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+            if col_name == "Date/Time":
+                for cell in worksheet.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                    for c in cell:
+                        if c.value is not None:
+                            c.number_format = "DD/MM/YYYY HH:MM"
+            elif col_name in ["Withdrawal (Debit)", "Deposit (Credit)", "Balance"]:
+                for cell in worksheet.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                    for c in cell:
+                        if c.value is not None:
+                            c.number_format = "#,##0.00"
+
     print(f"Successfully exported {len(df)} transactions to: {output_excel_path}")
     return output_excel_path
 
@@ -227,7 +305,7 @@ def main():
     args = parser.parse_args()
 
     if not args.pdf_path:
-        pdf_files = list(Path(".").glob("*.pdf"))
+        pdf_files = list(Path(".").rglob("*.PDF")) + list(Path(".").rglob("*.pdf"))
         if pdf_files:
             pdf_to_excel(str(pdf_files[0]), args.output_path)
         else:
