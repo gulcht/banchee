@@ -25,8 +25,6 @@ import pandas as pd
 import pdfplumber
 
 
-DEFAULT_PDF_PATH = "/Users/gu/Workspace/personal/banchee/data/sp-lakeside/01/ภงด.1-01/P010012603563_20260203_180147_attach.pdf"
-
 COLUMNS = [
     "ลำดับ",
     "เลขประจำตัวผู้เสียภาษีอากร",
@@ -141,6 +139,19 @@ def extract_pnd1_data(pdf_path: str | Path) -> pd.DataFrame:
     return df
 
 
+def extract_month_year_from_df(df: pd.DataFrame) -> Optional[str]:
+    """Extract MM-YYYY string (e.g., '01-2569', '01-2026') from payment dates in DataFrame."""
+    if df.empty or "วัน เดือน ปี ที่จ่าย" not in df.columns:
+        return None
+    for date_val in df["วัน เดือน ปี ที่จ่าย"].dropna():
+        match = re.search(r"^\d{1,2}/(\d{1,2})/(\d{2,4})", str(date_val).strip())
+        if match:
+            month_num = int(match.group(1))
+            year_val = match.group(2)
+            return f"{month_num:02d}-{year_val}"
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract employee tax data from PND1 (ภ.ง.ด.1) attachment PDF."
@@ -155,12 +166,12 @@ def main():
         "pdf_path",
         nargs="?",
         default=None,
-        help=f"Path to PND1 attachment PDF file (default: {DEFAULT_PDF_PATH})",
+        help="Path to PND1 attachment PDF file.",
     )
     parser.add_argument(
         "-o",
         "--output",
-        help="Path to export file (.xlsx, .csv, or .json). If omitted, prints table to terminal.",
+        help="Path to export file (.xlsx, .csv, or .json). If omitted, exports to <month>.xlsx.",
     )
     parser.add_argument(
         "--json",
@@ -169,7 +180,14 @@ def main():
     )
 
     args = parser.parse_args()
-    pdf_path = args.file or args.pdf_path or DEFAULT_PDF_PATH
+    pdf_path = args.file or args.pdf_path
+    if not pdf_path:
+        parser.print_help(sys.stderr)
+        print(
+            "\nError: PDF file is required. Please specify with -f / --file <path> or as an argument.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     try:
         df = extract_pnd1_data(pdf_path)
@@ -199,13 +217,11 @@ def main():
     elif args.json:
         print(df.to_json(orient="records", force_ascii=False, indent=2))
     else:
-        # Format terminal display
-        pd.set_option("display.max_columns", None)
-        pd.set_option("display.max_rows", None)
-        pd.set_option("display.width", 1000)
-        pd.set_option("display.unicode.east_asian_width", True)
-        print(f"\n--- Extracted Data ({len(df)} records) from {pdf_path} ---")
-        print(df.to_string(index=False))
+        month_year = extract_month_year_from_df(df)
+        default_filename = f"{month_year}.xlsx" if month_year else f"{Path(pdf_path).stem}.xlsx"
+        out_path = Path(default_filename)
+        df.to_excel(out_path, index=False)
+        print(f"Exported {len(df)} rows to Excel: {out_path}")
 
         total_income = df["จำนวนเงินได้ที่จ่ายในครั้งนี้"].sum()
         total_tax = df["จำนวนเงินภาษีที่หัก และนำส่งในครั้งนี้"].sum()
