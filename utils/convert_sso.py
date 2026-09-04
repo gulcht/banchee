@@ -30,6 +30,68 @@ COLUMNS = [
     "เงินสมทบ",
 ]
 
+THAI_MONTHS: Dict[str, str] = {
+    "มกราคม": "01",
+    "กุมภาพันธ์": "02",
+    "มีนาคม": "03",
+    "เมษายน": "04",
+    "พฤษภาคม": "05",
+    "มิถุนายน": "06",
+    "กรกฎาคม": "07",
+    "สิงหาคม": "08",
+    "กันยายน": "09",
+    "ตุลาคม": "10",
+    "พฤศจิกายน": "11",
+    "ธันวาคม": "12",
+    "ม.ค.": "01",
+    "ก.พ.": "02",
+    "มี.ค.": "03",
+    "เม.ย.": "04",
+    "พ.ค.": "05",
+    "มิ.ย.": "06",
+    "ก.ค.": "07",
+    "ส.ค.": "08",
+    "ก.ย.": "09",
+    "ต.ค.": "10",
+    "พ.ย.": "11",
+    "ธ.ค.": "12",
+}
+
+
+def parse_period(period_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract month (MM) and Gregorian year (YYYY) from period string."""
+    if not period_str:
+        return None, None
+
+    month: Optional[str] = None
+    for m_name, m_num in THAI_MONTHS.items():
+        if m_name in period_str:
+            month = m_num
+            break
+
+    # Look for 4-digit year (Buddhist or Gregorian)
+    year_match = re.search(r"(?:พ\.ศ\.\s*)?(\d{4})", period_str)
+    year: Optional[str] = None
+    if year_match:
+        y_val = int(year_match.group(1))
+        if y_val > 2400:  # Buddhist year
+            y_val -= 543
+        year = str(y_val)
+
+    return month, year
+
+
+def format_sso_export_name(metadata: Dict[str, str], ext: str = "xlsx") -> str:
+    """Generate export filename in format sso-MM-YYYY.<ext>."""
+    period_str = metadata.get("period", "") if metadata else ""
+    month, year = parse_period(period_str)
+    clean_ext = ext.lstrip(".")
+
+    if month and year:
+        return f"sso-{month}-{year}.{clean_ext}"
+    return f"sso.{clean_ext}"
+
+
 
 def clean_name(raw_name: str) -> str:
     """Clean extra spaces and trailing dashes in employee names."""
@@ -105,11 +167,15 @@ def parse_sso_line(line: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_sso_data(pdf_path: str | Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
+def extract_sso_data(pdf_source: str | Path | Any) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Extract SSO 1-10 part 2 records and metadata from PDF into a pandas DataFrame."""
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    if isinstance(pdf_source, (str, Path)):
+        pdf_path = Path(pdf_source)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        open_target = pdf_path
+    else:
+        open_target = pdf_source
 
     records: List[Dict[str, Any]] = []
     metadata: Dict[str, str] = {
@@ -119,7 +185,7 @@ def extract_sso_data(pdf_path: str | Path) -> Tuple[pd.DataFrame, Dict[str, str]
         "period": "",
     }
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(open_target) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             lines = text.split("\n")
@@ -148,10 +214,9 @@ def extract_sso_data(pdf_path: str | Path) -> Tuple[pd.DataFrame, Dict[str, str]
     return df, metadata
 
 
-def save_to_excel(df: pd.DataFrame, output_path: str | Path) -> None:
+def save_to_excel(df: pd.DataFrame, output_target: str | Path | Any) -> None:
     """Save DataFrame to Excel with proper formatting."""
-    output_path = Path(output_path)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output_target, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="SSO")
         worksheet = writer.sheets["SSO"]
 
@@ -178,12 +243,11 @@ def save_to_excel(df: pd.DataFrame, output_path: str | Path) -> None:
                             c.number_format = "#,##0.00"
 
 
-def save_to_csv(df: pd.DataFrame, output_path: str | Path) -> None:
+def save_to_csv(df: pd.DataFrame, output_target: str | Path | Any) -> None:
     """Save DataFrame to CSV with UTF-8 BOM encoding."""
-    output_path = Path(output_path)
     csv_df = df.copy()
     csv_df["เลขประจำตัวประชาชน"] = csv_df["เลขประจำตัวประชาชน"].astype(str)
-    csv_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    csv_df.to_csv(output_target, index=False, encoding="utf-8-sig")
 
 
 def main():
@@ -249,6 +313,10 @@ def main():
         print(df.to_json(orient="records", force_ascii=False, indent=2))
         return
 
+    # Default export filename sso-MM-YYYY
+    default_excel_name = format_sso_export_name(metadata, ext="xlsx")
+    default_csv_name = format_sso_export_name(metadata, ext="csv")
+
     # Handle explicit single output
     if args.output:
         out_path = Path(args.output)
@@ -265,17 +333,17 @@ def main():
             save_to_excel(df, out_path)
             print(f"Exported {len(df)} rows to: {out_path}")
     elif args.excel and not args.csv:
-        excel_path = Path(f"{input_stem}.xlsx")
+        excel_path = Path(default_excel_name)
         save_to_excel(df, excel_path)
         print(f"Exported {len(df)} rows to Excel: {excel_path}")
     elif args.csv and not args.excel:
-        csv_path = Path(f"{input_stem}.csv")
+        csv_path = Path(default_csv_name)
         save_to_csv(df, csv_path)
         print(f"Exported {len(df)} rows to CSV: {csv_path}")
     else:
         # Default: Export to both Excel and CSV
-        excel_path = Path(f"{input_stem}.xlsx")
-        csv_path = Path(f"{input_stem}.csv")
+        excel_path = Path(default_excel_name)
+        csv_path = Path(default_csv_name)
         save_to_excel(df, excel_path)
         save_to_csv(df, csv_path)
         print(f"Exported {len(df)} rows to Excel: {excel_path}")

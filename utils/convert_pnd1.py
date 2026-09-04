@@ -82,15 +82,19 @@ def parse_amount(main_val: Any, dec_val: Any = None) -> float:
         return 0.0
 
 
-def extract_pnd1_data(pdf_path: str | Path) -> pd.DataFrame:
+def extract_pnd1_data(pdf_source: str | Path | Any) -> pd.DataFrame:
     """Extract PND1 attachment table from PDF into a pandas DataFrame."""
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    if isinstance(pdf_source, (str, Path)):
+        pdf_path = Path(pdf_source)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        open_target = pdf_path
+    else:
+        open_target = pdf_source
 
     records: List[Dict[str, Any]] = []
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(open_target) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             tables = page.extract_tables()
             for table in tables:
@@ -139,16 +143,67 @@ def extract_pnd1_data(pdf_path: str | Path) -> pd.DataFrame:
     return df
 
 
-def extract_month_year_from_df(df: pd.DataFrame) -> Optional[str]:
-    """Extract MM-YYYY string (e.g., '01-2569', '01-2026') from payment dates in DataFrame."""
+def parse_month_year(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+    """Extract MM and Gregorian YYYY from payment dates in DataFrame."""
     if df.empty or "วัน เดือน ปี ที่จ่าย" not in df.columns:
-        return None
+        return None, None
     for date_val in df["วัน เดือน ปี ที่จ่าย"].dropna():
         match = re.search(r"^\d{1,2}/(\d{1,2})/(\d{2,4})", str(date_val).strip())
         if match:
             month_num = int(match.group(1))
-            year_val = match.group(2)
-            return f"{month_num:02d}-{year_val}"
+            year_val = int(match.group(2))
+            if year_val > 2400:  # Buddhist Era
+                year_val -= 543
+            return f"{month_num:02d}", str(year_val)
+    return None, None
+
+
+def format_pnd1_export_name(df: pd.DataFrame, ext: str = "xlsx") -> str:
+    """Generate export filename in format pnd1-MM-YYYY.<ext>."""
+    month, year = parse_month_year(df)
+    clean_ext = ext.lstrip(".")
+    if month and year:
+        return f"pnd1-{month}-{year}.{clean_ext}"
+    return f"pnd1.{clean_ext}"
+
+
+def save_to_excel(df: pd.DataFrame, output_target: str | Path | Any) -> None:
+    """Save DataFrame to Excel with formatted columns."""
+    with pd.ExcelWriter(output_target, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="PND1")
+        worksheet = writer.sheets["PND1"]
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            max_len = max(
+                len(str(col_name)),
+                max((len(str(val or "")) for val in df[col_name]), default=0),
+            )
+            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
+            if col_name == "เลขประจำตัวผู้เสียภาษีอากร":
+                for cell in worksheet.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                    for c in cell:
+                        if c.value is not None:
+                            c.number_format = "@"
+            elif col_name in ["จำนวนเงินได้ที่จ่ายในครั้งนี้", "จำนวนเงินภาษีที่หัก และนำส่งในครั้งนี้"]:
+                for cell in worksheet.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                    for c in cell:
+                        if c.value is not None:
+                            c.number_format = "#,##0.00"
+
+
+def save_to_csv(df: pd.DataFrame, output_target: str | Path | Any) -> None:
+    """Save DataFrame to CSV with UTF-8 BOM encoding."""
+    csv_df = df.copy()
+    if "เลขประจำตัวผู้เสียภาษีอากร" in csv_df.columns:
+        csv_df["เลขประจำตัวผู้เสียภาษีอากร"] = csv_df["เลขประจำตัวผู้เสียภาษีอากร"].astype(str)
+    csv_df.to_csv(output_target, index=False, encoding="utf-8-sig")
+
+
+def extract_month_year_from_df(df: pd.DataFrame) -> Optional[str]:
+    """Extract MM-YYYY string (e.g., '01-2569', '01-2026') from payment dates in DataFrame."""
+    month, year = parse_month_year(df)
+    if month and year:
+        return f"{month}-{year}"
     return None
 
 
