@@ -1,51 +1,65 @@
 from datetime import datetime
 from enum import Enum
 import io
+import os
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import urllib.parse
 import zipfile
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+# Load environment variables from .env file if present
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.exists():
+    with open(_env_path, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                os.environ.setdefault(_key.strip(), _val.strip().strip("'\""))
+
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from utils.convert_pnd1 import (
+from converters.pnd1 import (
     extract_pnd1_data,
     format_pnd1_export_name,
     parse_month_year as parse_pnd1_month_year,
     save_to_csv as save_pnd1_to_csv,
     save_to_excel as save_pnd1_to_excel,
 )
-from utils.convert_pnd3 import (
+from converters.pnd3 import (
     extract_pnd3_data,
     format_pnd3_export_name,
     parse_month_year as parse_pnd3_month_year,
     save_to_csv as save_pnd3_to_csv,
     save_to_excel as save_pnd3_to_excel,
 )
-from utils.convert_pnd53 import (
+from converters.pnd53 import (
     extract_pnd53_data,
     format_pnd53_export_name,
     parse_month_year as parse_pnd53_month_year,
     save_to_csv as save_pnd53_to_csv,
     save_to_excel as save_pnd53_to_excel,
 )
-from utils.convert_sso import (
+from converters.sso import (
     extract_sso_data,
     format_sso_export_name,
     parse_period,
     save_to_csv as save_sso_to_csv,
     save_to_excel as save_sso_to_excel,
 )
-from utils.convert_statement import (
+from converters.statement import (
     extract_statement_dataframe,
     format_statement_export_name,
     parse_statement_month_year,
     save_to_csv as save_statement_to_csv,
     save_to_excel as save_statement_to_excel,
 )
+from reconcilers.payroll import PayrollReconciler
+import pdfplumber
 
 
 class OutputFormat(str, Enum):
@@ -69,6 +83,10 @@ tags_metadata = [
     {
         "name": "Bank Statement (รายการเดินบัญชี)",
         "description": "Extract transaction records from bank statement PDFs (ประเภทบัญชีเดินสะพัด / Current Account).",
+    },
+    {
+        "name": "Payroll Reconciliation (กระทบยอดเงินเดือน)",
+        "description": "Reconcile monthly payroll between P.N.D. 1 (ภ.ง.ด. 1) and SSO (สปส. 1-10) attachments.",
     },
     {
         "name": "System",
@@ -100,14 +118,54 @@ High-performance REST API service designed to extract and convert Thai accountin
     },
 )
 
+BACKEND_INTERNAL_SECRET = os.getenv("BACKEND_INTERNAL_SECRET")
+
+
+@app.middleware("http")
+async def verify_backend_secret(request: Request, call_next):
+    # Bypass OPTIONS (CORS preflight) and health check / docs endpoints
+    if request.method == "OPTIONS" or request.url.path in [
+        "/",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+    ]:
+        return await call_next(request)
+
+    # If secret is set, verify x-backend-secret header
+    if BACKEND_INTERNAL_SECRET:
+        secret = request.headers.get("x-backend-secret")
+        if not secret or secret != BACKEND_INTERNAL_SECRET:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Forbidden: Invalid or missing x-backend-secret header."},
+            )
+
+    return await call_next(request)
+
+
 # Enable CORS for frontend integration
+raw_frontend_url = os.getenv("FRONTEND_URL", "localhost:3000")
+cors_origins = [origin.strip() for origin in raw_frontend_url.split(",") if origin.strip()]
+# Normalize origins to include scheme if omitted (browser Origin header sends scheme e.g. http://localhost:3000)
+allowed_origins = set()
+for origin in cors_origins:
+    if origin == "*":
+        allowed_origins.add("*")
+    elif not origin.startswith(("http://", "https://")):
+        allowed_origins.add(f"http://{origin}")
+        allowed_origins.add(f"https://{origin}")
+    else:
+        allowed_origins.add(origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 @app.get(
@@ -551,4 +609,161 @@ async def convert_statement(
         save_excel_func=save_statement_to_excel,
         save_csv_func=save_statement_to_csv,
     )
+
+
+# -----------------------------------------------------------------------------
+# 6. Payroll Reconciliation (PND1 vs SSO)
+# -----------------------------------------------------------------------------
+@app.post(
+    "/reconcile/payroll",
+    tags=["Payroll Reconciliation (กระทบยอดเงินเดือน)"],
+    summary="Reconcile PND1 and SSO PDF documents into 12-month reconciliation workbook",
+    description="""
+Upload multiple **P.N.D. 1 (ภ.ง.ด. 1 ใบแนบ)** and **SSO 1-10 Part 2 (สปส. 1-10 ส่วนที่ 2)** PDF documents.
+
+### What it produces:
+- 5 rows per employee across 12 months:
+  1. เงินเดือน (จาก SSO ค่าจ้าง)
+  2. ปกส (จาก SSO เงินสมทบ)
+  3. รายได้อื่น (ภ.ง.ด.1 จ่าย - SSO เงินเดือน)
+  4. จำนวนเงินที่จ่าย (จาก ภ.ง.ด.1)
+  5. จำนวนเงินภาษีที่หัก (จาก ภ.ง.ด.1)
+- Monthly summary rows and cross-check validation row.
+- Output formats: **`xlsx`** (formatted Excel workbook) or **`csv`** (UTF-8 with BOM).
+    """,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Successful reconciliation. Returns Excel workbook (.xlsx) or CSV (.csv).",
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+                "text/csv": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+            },
+        },
+        status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"model": ErrorResponse},
+    },
+)
+async def reconcile_payroll(
+    files: List[UploadFile] = File(
+        ...,
+        description="SSO and PND1 attachment PDF documents.",
+    ),
+    format: OutputFormat = Query(
+        OutputFormat.XLSX,
+        description="Export format: `xlsx` or `csv` (Default: `xlsx`).",
+    ),
+    company: Optional[str] = Query(
+        None,
+        description="Company name override (auto-detected if not specified).",
+    ),
+    tax_id: Optional[str] = Query(
+        None,
+        description="Company Tax ID override.",
+    ),
+    director_salary_from_pnd: bool = Query(
+        True,
+        description="Treat employees without SSO (e.g. Director) as salary from PND1 paid amount.",
+    ),
+):
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files provided.",
+        )
+
+    reconciler = PayrollReconciler(
+        director_salary_from_pnd=director_salary_from_pnd,
+        company_name=company,
+        company_tax_id=tax_id,
+    )
+
+    processed_count = 0
+    for upload_file in files:
+        if not upload_file.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file type for '{upload_file.filename}'. Please upload PDF files only.",
+            )
+
+        content = await upload_file.read()
+        if not content:
+            continue
+
+        fname = upload_file.filename.lower()
+        file_bytes = io.BytesIO(content)
+
+        # Detect whether file is SSO or PND1
+        is_sso = False
+        is_pnd1 = False
+
+        if "form" in fname:
+            continue
+        elif "sso" in fname or "สปส" in fname:
+            is_sso = True
+        elif "p01" in fname or "ภงด" in fname or "attach" in fname:
+            is_pnd1 = True
+        else:
+            # Inspect first page text
+            try:
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    txt = pdf.pages[0].extract_text() or ""
+                    if "แบบรายการแสดงการส่งเงินสมทบ" in txt or "สปส. 1-10" in txt:
+                        is_sso = True
+                    elif "ภ.ง.ด.1" in txt and "ใบแนบ" in txt:
+                        is_pnd1 = True
+            except Exception:
+                pass
+
+        if is_sso:
+            try:
+                reconciler.process_sso_file(file_bytes)
+                processed_count += 1
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Failed to process SSO file '{upload_file.filename}': {str(e)}",
+                )
+        elif is_pnd1:
+            try:
+                reconciler.process_pnd1_file(file_bytes)
+                processed_count += 1
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Failed to process PND1 file '{upload_file.filename}': {str(e)}",
+                )
+
+    if processed_count == 0 or not reconciler.employees:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid SSO or P.N.D.1 attachment records were found in the uploaded PDFs.",
+        )
+
+    export_ext = format.value
+    export_filename = reconciler.get_export_filename(export_ext)
+    file_buffer = io.BytesIO()
+
+    if export_ext == "xlsx":
+        reconciler.generate_excel(file_buffer)
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        reconciler.generate_csv(file_buffer)
+        media_type = "text/csv; charset=utf-8"
+
+    file_buffer.seek(0)
+    encoded_filename = urllib.parse.quote(export_filename)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{export_filename}"; filename*=UTF-8\'\'{encoded_filename}',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    }
+    return StreamingResponse(
+        file_buffer,
+        media_type=media_type,
+        headers=headers,
+    )
+
 

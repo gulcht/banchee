@@ -21,6 +21,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,13 +29,13 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# Ensure repository root is in sys.path
-REPO_ROOT = Path(__file__).resolve().parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# Ensure backend root is in sys.path
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
-from utils.convert_pnd1 import extract_pnd1_data
-from utils.convert_sso import extract_sso_data, parse_period
+from converters.pnd1 import extract_pnd1_data
+from converters.sso import extract_sso_data, parse_period
 
 MONTH_HEADERS = [
     "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
@@ -104,6 +105,7 @@ class PayrollReconciler:
 
         # Monthly records: normalized_id -> month (1..12) -> data dict
         self.records: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+        self.years: List[str] = []
 
     def _register_employee(self, norm_id: str, name: str, source: str):
         """Register employee and keep preferred name (SSO preferred over PND1)."""
@@ -118,14 +120,18 @@ class PayrollReconciler:
             self.employees[norm_id]["name"] = name
             self.employees[norm_id]["source"] = source
 
-    def process_sso_file(self, pdf_path: str | Path):
+    def process_sso_file(self, pdf_source: str | Path | Any):
         """Extract and ingest an SSO 1-10 Part 2 PDF."""
-        df, meta = extract_sso_data(pdf_path)
+        df, meta = extract_sso_data(pdf_source)
         period = meta.get("period", "")
         month = extract_month_from_sso_period(period)
         if not month:
-            print(f"[WARN] Could not determine month from SSO file {pdf_path}: period='{period}'")
+            print(f"[WARN] Could not determine month from SSO file: period='{period}'")
             return
+
+        _, sso_year = parse_period(period)
+        if sso_year and sso_year not in self.years:
+            self.years.append(sso_year)
 
         # Auto-detect company details from SSO metadata if not explicitly provided
         if not self.company_name and meta.get("company"):
@@ -148,17 +154,27 @@ class PayrollReconciler:
             rec["sso_contrib"] = contrib
             rec["has_sso"] = 1.0
 
-    def process_pnd1_file(self, pdf_path: str | Path):
+    def process_pnd1_file(self, pdf_source: str | Path | Any):
         """Extract and ingest a PND1 Attachment PDF."""
-        df = extract_pnd1_data(pdf_path)
+        df = extract_pnd1_data(pdf_source)
         if df.empty:
             return
 
         first_date = df["วัน เดือน ปี ที่จ่าย"].dropna().iloc[0] if "วัน เดือน ปี ที่จ่าย" in df.columns else ""
         month = extract_month_from_pnd1_date(str(first_date))
         if not month:
-            print(f"[WARN] Could not determine month from PND1 file {pdf_path}: date='{first_date}'")
+            print(f"[WARN] Could not determine month from PND1 file: date='{first_date}'")
             return
+
+        # Extract year from date string if available
+        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", str(first_date).strip())
+        if m:
+            pnd_year = int(m.group(3))
+            if pnd_year > 2400:
+                pnd_year -= 543
+            pnd_year_str = str(pnd_year)
+            if pnd_year_str not in self.years:
+                self.years.append(pnd_year_str)
 
         for _, row in df.iterrows():
             norm_id = normalize_id(row["เลขประจำตัวผู้เสียภาษีอากร"])
@@ -243,7 +259,7 @@ class PayrollReconciler:
         else:
             return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    def generate_excel(self, output_file: str | Path):
+    def generate_excel(self, output_target: str | Path | Any):
         """Generate formatted Excel file matching standard reconciliation template."""
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -505,12 +521,95 @@ class PayrollReconciler:
         for col_letter, width in column_widths.items():
             ws.column_dimensions[col_letter].width = width
 
-        # Ensure directory exists and save
-        out_path = Path(output_file)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(out_path)
-        print(f"[SUCCESS] Reconciled workbook saved to: {out_path}")
+        # Ensure directory exists if saving to path
+        if isinstance(output_target, (str, Path)):
+            out_path = Path(output_target)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            wb.save(out_path)
+            print(f"[SUCCESS] Reconciled workbook saved to: {out_path}")
+        else:
+            wb.save(output_target)
         print(f"Total employees reconciled: {len(self.employee_order)}")
+
+    def generate_csv(self, output_target: str | Path | Any):
+        """Generate reconciled summary as CSV with UTF-8 BOM encoding."""
+        import csv
+        headers = ["ลำดับ", "เลขประจำตัว/ชื่อ", "เงินได้"] + MONTH_HEADERS + ["รวม"]
+        rows: List[List[Any]] = [headers]
+
+        seq = 1
+        sal_sums = [0.0] * 12
+        sso_sums = [0.0] * 12
+        oth_sums = [0.0] * 12
+        paid_sums = [0.0] * 12
+        tax_sums = [0.0] * 12
+
+        for norm_id in self.employee_order:
+            emp = self.employees[norm_id]
+            formatted_id = format_tax_id(norm_id)
+            emp_name = emp["name"]
+
+            sal_vals = []
+            sso_vals = []
+            oth_vals = []
+            paid_vals = []
+            tax_vals = []
+
+            for m in range(1, 13):
+                sal_v, sso_v, oth_v, paid_v, tax_v = self.calculate_employee_month(norm_id, m)
+                sal_vals.append(sal_v)
+                sso_vals.append(sso_v)
+                oth_vals.append(oth_v)
+                paid_vals.append(paid_v)
+                tax_vals.append(tax_v)
+
+                sal_sums[m - 1] += sal_v
+                sso_sums[m - 1] += sso_v
+                oth_sums[m - 1] += oth_v
+                paid_sums[m - 1] += paid_v
+                tax_sums[m - 1] += tax_v
+
+            rows.append([seq, formatted_id, "เงินเดือน"] + sal_vals + [sum(sal_vals)])
+            rows.append(["", emp_name, "ปกส"] + sso_vals + [sum(sso_vals)])
+            rows.append(["", "", "รายได้อื่น"] + oth_vals + [sum(oth_vals)])
+            rows.append(["", "", "จำนวนเงินที่จ่าย"] + paid_vals + [sum(paid_vals)])
+            rows.append(["", "", "จำนวนเงินภาษีที่หัก"] + tax_vals + [sum(tax_vals)])
+            seq += 1
+
+        # Summary rows
+        rows.append(["", "รวม", "เงินเดือน"] + sal_sums + [sum(sal_sums)])
+        rows.append(["", "", "ปกส"] + sso_sums + [sum(sso_sums)])
+        rows.append(["", "", "รายได้อื่น"] + oth_sums + [sum(oth_sums)])
+        rows.append(["", "", "จำนวนเงินที่จ่าย"] + paid_sums + [sum(paid_sums)])
+        rows.append(["", "", "จำนวนเงินภาษีที่หัก"] + tax_sums + [sum(tax_sums)])
+
+        # Validation row
+        diff_vals = [paid_sums[i] - (sal_sums[i] + oth_sums[i]) for i in range(12)]
+        rows.append(["", "ตรวจสอบความถูกต้อง", "ผลต่าง (จ่าย - (เงินเดือน+รายได้อื่น))"] + diff_vals + [sum(diff_vals)])
+
+        if isinstance(output_target, (str, Path)):
+            out_path = Path(output_target)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, mode="w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+        else:
+            # File-like object (e.g. io.BytesIO or io.StringIO)
+            import io
+            if isinstance(output_target, io.BytesIO):
+                text_buf = io.StringIO()
+                writer = csv.writer(text_buf)
+                writer.writerows(rows)
+                output_target.write(text_buf.getvalue().encode("utf-8-sig"))
+            else:
+                writer = csv.writer(output_target)
+                writer.writerows(rows)
+
+    def get_export_filename(self, ext: str = "xlsx") -> str:
+        """Get export filename formatted with detected year."""
+        clean_ext = ext.lstrip(".")
+        year_str = self.years[0] if self.years else datetime.now().strftime("%Y")
+        return f"payroll-reconciled-{year_str}.{clean_ext}"
 
 
 def main():

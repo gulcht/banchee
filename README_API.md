@@ -11,15 +11,15 @@ FastAPI-based REST service for extracting and converting Thai accounting and tax
 Ensure Python 3.9+ is installed, then install the dependencies:
 
 ```bash
+cd backend
 pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
 ```
 
-### 2. Running the Server
-
-Start the API with Uvicorn:
+Or from the repository root:
 
 ```bash
-uvicorn main:app --reload --port 8000
+uvicorn backend.main:app --reload --port 8000
 ```
 
 - **Interactive Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
@@ -38,6 +38,7 @@ All conversion endpoints share identical query parameters and packaging behavior
 | `POST /convert/pnd3` | P.N.D. 3 (ภ.ง.ด. 3 ใบแนบ) | Withholding tax for natural persons (individuals) |
 | `POST /convert/pnd53` | P.N.D. 53 (ภ.ง.ด. 53 ใบแนบ) | Withholding tax for corporate entities |
 | `POST /convert/statement` | Bank Statement (ประเภทบัญชี: เดินสะพัด) | Current account bank statement records (SCB, etc.) |
+| `POST /reconcile/payroll` | Payroll Reconciliation (ภ.ง.ด.1 vs สปส. 1-10) | Reconcile 12-month payroll and withholding tax |
 
 ---
 
@@ -137,6 +138,24 @@ curl -X POST "http://localhost:8000/convert/statement" \
 curl -X POST "http://localhost:8000/convert/statement?format=xlsx" \
   -F "files=@scb_jan.pdf" \
   -F "files=@scb_feb.pdf" \
+  -OJ
+```
+
+### 6. Payroll Reconciliation (ภ.ง.ด. 1 vs สปส. 1-10)
+
+```bash
+# Upload all monthly PND1 and SSO PDFs to produce reconciled 12-month Excel
+curl -X POST "http://localhost:8000/reconcile/payroll?format=xlsx" \
+  -F "files=@sso_jan.pdf" \
+  -F "files=@sso_feb.pdf" \
+  -F "files=@pnd1_jan.pdf" \
+  -F "files=@pnd1_feb.pdf" \
+  -OJ
+
+# Output as CSV with UTF-8 BOM
+curl -X POST "http://localhost:8000/reconcile/payroll?format=csv" \
+  -F "files=@sso_jan.pdf" \
+  -F "files=@pnd1_jan.pdf" \
   -OJ
 ```
 
